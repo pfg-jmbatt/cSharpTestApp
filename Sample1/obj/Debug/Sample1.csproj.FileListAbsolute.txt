@@ -1,0 +1,7 @@
+E:\gh-pfgjmbatt\cSharpTestApp\Sample1\bin\Debug\Sample1.exe.config
+E:\gh-pfgjmbatt\cSharpTestApp\Sample1\bin\Debug\Sample1.exe
+E:\gh-pfgjmbatt\cSharpTestApp\Sample1\bin\Debug\Sample1.pdb
+E:\gh-pfgjmbatt\cSharpTestApp\Sample1\obj\Debug\Sample1.csprojAssemblyReference.cache
+E:\gh-pfgjmbatt\cSharpTestApp\Sample1\obj\Debug\Sample1.csproj.CoreCompileInputs.cache
+E:\gh-pfgjmbatt\cSharpTestApp\Sample1\obj\Debug\Sample1.exe
+E:\gh-pfgjmbatt\cSharpTestApp\Sample1\obj\Debug\Sample1.pdb

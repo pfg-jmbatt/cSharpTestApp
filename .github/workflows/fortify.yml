@@ -1,0 +1,260 @@
+# This workflow will run a Fortify scan, check the scan for Critical and High
+# vulnerabilities, and break the build if Critical and/or Highs exist.
+# You may disable the build breaker by changing the "$breakBuild" variable 
+# to $false. By default it's set to $true.
+
+name: Fortify SAST ScanCentral with Vuln Check and Build Breaker v1
+# required secret variables
+#   CLIENT_AUTH_TOKEN - client auth token needed to run scans
+#   SCAN_CENTRAL_CTRL_URL = Scan Central Controller URL
+#   SSC_UPLOAD_TOKEN = ScanCentralScmIntegrationToken (DECODED), specific to the GH Org
+#   FORTIFY_API_TOKEN = ScanCentralScmIntegrationToken (ENCODED), specific to the GH Org
+#   SSC_API_URL = URL for the Fortify API calls
+#   SSC_URL = cloudscan controller URL (DEPRECATED). Replaced by SCAN_CENTRAL_CTRL_URL. 
+#
+#  NOTE: GH local account created in Fortify must be assigned to the custom role, ScanCentralScmIntegration, which is modeled 
+#        after the ScanCentral role with some additional permissions for viewing scan jobs and app versions.
+#        Added new Token to serviceContext.xml called, ScanCentralScmIntegrationToken. This token is modeled after the ScanCentralCtrlToken
+#        but with some additional permissions for viewing scan jobs and app versions.
+
+# Triggers workflow on push or pull request
+on: #workflow_dispatch #[repository_dispatch]
+  push:
+    branches: 
+     - master
+     - main
+  pull_request:
+    branches: 
+     - master
+     - main
+  workflow_dispatch:
+
+jobs:
+  Fortify-SAST:
+    # Use the appropriate runner for building your source code
+    runs-on: windows-latest
+    outputs: 
+        output1: ${{ steps.job-token.outputs.value }} 
+        
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'csharp' ]
+        
+    steps: 
+      # Check out source code
+    - name: Check Out Source Code
+      uses: actions/checkout@v2
+      with: 
+          fetch-depth: 2
+            
+    - name: setup-msbuild
+      uses: microsoft/setup-msbuild@v1
+
+    - uses: nuget/setup-nuget@v1
+
+    - run: cd $GITHUB_WORKSPACE
+      
+    ### Set up Fortify ScanCentral Client ###
+    - name: Download Fortify ScanCentral Client 
+      uses: fortify/gha-setup-scancentral-client@v1  # From Fortify
+      with:
+          version: 20.2.0  # Updated from '20.1.0' the default
+          client-auth-token: ${{ secrets.CLIENT_AUTH_TOKEN }}  # Required by our ScanCentral Controllers
+    
+    #- name: Build app
+    #  run: msbuild .\<sln folder>\<sln file> /p:Configuration=Release /p:UseSharedCompilation=false
+      
+    ### Setup Variables and run Fortify ScanCentral Client ###
+    #- uses: actions/checkout@v1
+    - name: Setup variables and run Fortify ScanCentral Client 
+      id: job-token
+      run: |
+        $URL = "${{ secrets.SCAN_CENTRAL_CTRL_URL }}"
+        $TOKEN = "${{ secrets.SSC_UPLOAD_TOKEN }}"
+        $APPLICATION = "${{ github.repository_owner }}".ToLower()
+        $VERSION = "${{ github.event.repository.name }}".ToLower()   
+        $searchValue = "Submitted job and received token: "
+     
+        Write-Host "Running scan central command"
+        Write-Host "Version = ${VERSION}"
+        
+        # get solution path dynamically. If more than one solution then would need to iterate through each one...
+        $rootPath = Get-Location
+        Write-Host "Root Path = $rootPath"
+        
+        $slnPath = Get-ChildItem -Path $rootPath -Recurse -ErrorAction SilentlyContinue -Filter *.sln
+        Write-Host ("Solution Path: $slnPath")
+        
+        $path = ".\" + $slnPath.Directory.Name
+        Write-Host ("ScanCentral Path: $path")
+        
+        # this works. need to find a way to write out the job token, however.
+        $r = scancentral -url ${URL} start -bt msbuild -bf ${path} -upload -application ${APPLICATION} -version ${VERSION} -uptoken ${TOKEN}
+           
+        # attempt to get job token
+          $searchValue = "Submitted job and received token: "
+          $jobToken = (${r} |Select-String ${searchValue}).ToString().Substring(${searchValue}.Length).trim()
+    
+        Write-Host "Token returned is $jobToken..."
+
+        # set the Job Token output variable
+        echo "::set-output name=value::$jobToken"
+
+      #id: job-token
+      
+    - name: Show that we have the Job Token value 
+      run: |
+         Write-Host ("My Job Token is... ${{ steps.job-token.outputs.value }}." )
+      
+  # maybe split this into 2 jobs. One to check status of scan and the other to get Critical/Highs and break the build
+  # job to get count of Critical/High vulnerabilities associated with this repo
+  get-fortify-scan-status:
+    needs: Fortify-SAST # this setting makes this job dependent on build completing successfully
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: pwsh
+    outputs: 
+        output1: ${{ steps.ScanStatus.outputs.VERSION-ID }}
+    
+    steps:
+    - uses: actions/checkout@v1
+    - name: Get scan status based on job token and return version ID
+      id: ScanStatus
+      run: |
+        $org = "${{ github.repository_owner }}".ToLower()
+        $repo = "${{ github.event.repository.name }}".ToLower()
+        $fortifyToken = "${{ secrets.FORTIFY_API_TOKEN }}"
+        $fortifyURL = "${{ secrets.SSC_API_URL }}"
+        $jobToken = "${{ needs.Fortify-SAST.outputs.output1 }}"
+        # Enable/Disable build break. Default = true/enabled
+          $breakBuild = $true
+          
+        Write-Host ("GH Org = $org, Repo = $repo, Job Token = $jobToken }} ")  
+ 
+         # set headers for API calls                       
+          $headers = @{ "Authorization" = "FortifyToken $fortifyToken" }
+              
+        # Ensures that Invoke-WebRequest uses TLS 1.2
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12        
+        
+        # Give scan time to complete and upload so will actually get those results
+        # add a little pause to give the scan time to get to Scan Central
+          Write-Host "Taking a breath for 60 seconds to allow time for scan to get to Scan Central"
+          Start-Sleep -Seconds 60
+        
+        # get scan info from job token
+          $url = $null
+          $url = "$fortifyURL/cloudjobs/$jobToken"
+          
+          Write-Host "URL = $url"
+          $results = $null
+          
+        DO 
+        {
+            try {
+                $results = Invoke-RestMethod $url -Method Get -Headers $headers
+                # Check if scan is completed (state of UPLOAD_COMPLETED).
+                # may want to add other statuses like faulted, failed, canceled, etc.)
+                # SCAN_FAULTED
+                  $completedScan = $null
+                  #$completedScan = $results.data | Where-Object { $_.jobState -in ('UPLOAD_COMPLETED') } 
+                  # need to consider scans that fail/fault/cancel/etc
+                    $completedScan = $results.data | Where-Object { $_.jobState -in ('UPLOAD_COMPLETED') -or $_.jobState -contains 'FAULTED' -or $_.jobState -contains 'CANCEL' -or $_.jobState -contains 'FAILED' -or $_.jobState -contains 'INVALID' } 
+                # ! ! ! pvId has the version ID so can get from that and skip the call to get it ! ! !
+                if ($completedScan -eq $null ) {
+                    Write-Host "Scan is still running. Checking back in 30 seconds..."
+                    $isScanRunning = $true
+                    Start-Sleep -Seconds 30
+                } else {
+                    $versionId = $completedScan.pvId
+                    # set output variable for version ID
+                    echo "::set-output name=VERSION-ID::$versionId"
+                    
+                    $isScanRunning = $false
+                    $jobState = $completedScan.jobState
+                    
+                    if ($jobState -eq 'UPLOAD_COMPLETED') {    
+                       Write-Host "Scan completed and uploaded! Version ID = $versionId"
+                    } else {
+                        Write-Host "Scan could not complete successfully and returned a job state of $jobState. Could not check for new vulnerabilities."
+                        exit 1
+                    }
+                }
+            } catch {
+                Write-Host $_.Exception.Message
+                $isScanRunning = $true
+                Start-Sleep -Seconds 30
+            }
+        } while ($isScanRunning -eq $true)
+        
+    - name: Show that we have the Version ID value 
+      run: |
+         Write-Host ("My Version ID is... ${{ steps.ScanStatus.outputs.VERSION-ID }}." )
+          
+  # maybe split this into 2 jobs. One to check status of scan and the other to get Critical/Highs and break the build
+  # job to get count of Critical/High vulnerabilities associated with this repo
+  get-fortify-vulnerabilities:
+    needs: get-fortify-scan-status # this setting makes this job dependent on build completing successfully
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: pwsh
+    
+    steps:
+    - uses: actions/checkout@v1
+    - name: Run PowerShell Get Critical/High Count script
+      id: BreakBuild
+      run: |
+        $fortifyURL = "${{ secrets.SSC_API_URL }}"
+        $fortifyToken = "${{ secrets.FORTIFY_API_TOKEN }}"
+        $versionId = "${{ needs.get-fortify-scan-status.outputs.output1 }}"
+        # Enable/Disable build break. Default = true/enabled
+          $breakBuild = $true
+          
+        Write-Host ("Version ID = $versionId ")  
+                
+         # set headers for API calls                       
+          $headers = @{ "Authorization" = "FortifyToken $fortifyToken" }
+              
+        # Ensures that Invoke-WebRequest uses TLS 1.2
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12        
+        
+        # get scan info from job token
+          $url = $null
+          $url = "$fortifyURL/cloudjobs/$jobToken"
+          
+          Write-Host "URL = $url"
+          $results = $null
+        
+        Write-Host "Checking scan results for Critical and High vulnerabilities........."
+        
+        $url = $null
+        $url = "$fortifyURL/projectVersions/$versionId/issues?start=0&limit=0&showhidden=false&showremoved=false&showsuppressed=false&showshortfilenames=false"
+        $results = $null
+        $results = Invoke-RestMethod $url -Method Get -Headers $headers
+        
+        $refinedResults = $results.data | Where-Object {$_.friority -in ('Critical', 'High') -and $_.primaryTag -notin ('Not an Issue', 'Risk Accepted')}
+        $critHighCount = $refinedResults.Count
+        
+        if ($critHighCount -gt 0) { 
+            Write-Host "This version contains $critHighCount Criticals/Highs!" -ForegroundColor Red
+            
+            #$targetUrl = $refinedResults._href[0].Substring(0,$refinedResults._href[0].IndexOf("/api")) + "/html/ssc/version/$versionId"
+            $targetUrl = $fortifyUrl.Substring(0,$fortifyUrl.IndexOf("/api")) + "/html/ssc/version/$versionId"
+            
+            Write-Host "Follow this link to view the latest results, $targetUrl"
+            
+            if ($breakBuild) {
+                Write-Host "Build breaker ENABLED" 
+                # Give Import-SSC-SAST time to complete before breaking the build
+                  Start-Sleep -Seconds 30 
+                exit 1
+            } else {
+                Write-Host "Build breaker disabled"
+            }  
+            
+        } else {
+            Write-Host "This version DOES NOT contain Criticals or Highs!" -ForegroundColor Green
+        }
